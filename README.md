@@ -1,5 +1,7 @@
 # markscribe
 
+> This is a fork of [muesli/markscribe](https://github.com/muesli/markscribe), whose last release is from 2021. It is built with a current Go toolchain and current dependencies and is what [freifunkMUC/readme-scribe](https://github.com/freifunkMUC/readme-scribe) runs. Templates and behaviour are unchanged; the module path is `github.com/freifunkMUC/markscribe`.
+
 [![Latest Release](https://img.shields.io/github/release/muesli/markscribe.svg)](https://github.com/muesli/markscribe/releases)
 [![Build Status](https://github.com/muesli/markscribe/workflows/build/badge.svg)](https://github.com/muesli/markscribe/actions)
 [![Go ReportCard](https://goreportcard.com/badge/muesli/markscribe)](https://goreportcard.com/report/muesli/markscribe)
