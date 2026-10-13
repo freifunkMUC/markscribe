@@ -19,6 +19,9 @@ const (
 	// releaseBatchSize is the number of repositories whose releases are
 	// requested in a single query.
 	releaseBatchSize = 50
+
+	// maxPageSize is the largest page GitHub returns for a connection.
+	maxPageSize = 100
 )
 
 var recentContributionsQuery struct {
@@ -48,11 +51,12 @@ var recentPullRequestsQuery struct {
 		Login        githubv4.String
 		PullRequests struct {
 			TotalCount githubv4.Int
+			PageInfo   qlPageInfo
 			Edges      []struct {
 				Cursor githubv4.String
 				Node   qlPullRequest
 			}
-		} `graphql:"pullRequests(first: $count, orderBy: {field: CREATED_AT, direction: DESC})"`
+		} `graphql:"pullRequests(first: $count, after: $after, orderBy: {field: CREATED_AT, direction: DESC})"`
 	} `graphql:"user(login:$username)"`
 }
 
@@ -61,11 +65,12 @@ var recentReposQuery struct {
 		Login        githubv4.String
 		Repositories struct {
 			TotalCount githubv4.Int
+			PageInfo   qlPageInfo
 			Edges      []struct {
 				Cursor githubv4.String
 				Node   qlRepository
 			}
-		} `graphql:"repositories(first: $count, privacy: PUBLIC, isFork: $isFork, ownerAffiliations: OWNER, orderBy: {field: CREATED_AT, direction: DESC})"`
+		} `graphql:"repositories(first: $count, after: $after, privacy: PUBLIC, isFork: $isFork, ownerAffiliations: OWNER, orderBy: {field: CREATED_AT, direction: DESC})"`
 	} `graphql:"user(login:$username)"`
 }
 
@@ -204,7 +209,7 @@ func recentContributions(count int) []Contribution {
 	var contributions []Contribution
 	for _, v := range contributedRepos() {
 		// ignore meta-repo
-		if string(v.Repository.NameWithOwner) == fmt.Sprintf("%s/%s", username, username) {
+		if isMetaRepo(v.Repository) {
 			continue
 		}
 		if v.Repository.IsPrivate {
@@ -224,32 +229,71 @@ func recentContributions(count int) []Contribution {
 	return contributions
 }
 
+// firstPageSize returns the number of entries to ask for when count entries
+// are wanted. It is one more than wanted, in case we encounter the meta-repo
+// itself, but never more than GitHub returns.
+func firstPageSize(count int) int {
+	if count >= maxPageSize {
+		return maxPageSize
+	}
+	return count + 1
+}
+
+// isMetaRepo reports whether the repository is the user's profile
+// repository, the one that is named like the user.
+func isMetaRepo(repo qlRepository) bool {
+	return string(repo.NameWithOwner) == fmt.Sprintf("%s/%s", username, username)
+}
+
+// recentPullRequests returns the count most recent pull requests the user
+// opened in public repositories other than the meta-repo.
+//
+// Pull requests that are left out do not count: if a page does not hold
+// enough pull requests that can be shown, the next page is fetched, until
+// there are count of them or no pull requests are left.
 func recentPullRequests(count int) []PullRequest {
 	// fmt.Printf("Finding recently created pullRequests...\n")
 
 	var pullRequests []PullRequest
-	variables := map[string]interface{}{
-		"username": githubv4.String(username),
-		"count":    githubv4.Int(count + 1), // +1 in case we encounter the meta-repo itself
-	}
-	err := gitHubClient.Query(context.Background(), &recentPullRequestsQuery, variables)
-	if err != nil {
-		panic(err)
+	if count <= 0 {
+		return pullRequests
 	}
 
-	for _, v := range recentPullRequestsQuery.User.PullRequests.Edges {
-		// ignore meta-repo
-		if string(v.Node.Repository.NameWithOwner) == fmt.Sprintf("%s/%s", username, username) {
-			continue
+	var after *githubv4.String
+	pageSize := firstPageSize(count)
+	for {
+		variables := map[string]interface{}{
+			"username": githubv4.String(username),
+			"count":    githubv4.Int(pageSize),
+			"after":    after,
 		}
-		if v.Node.Repository.IsPrivate {
-			continue
+		err := gitHubClient.Query(context.Background(), &recentPullRequestsQuery, variables)
+		if err != nil {
+			panic(err)
 		}
 
-		pullRequests = append(pullRequests, pullRequestFromQL(v.Node))
-		if len(pullRequests) == count {
+		for _, v := range recentPullRequestsQuery.User.PullRequests.Edges {
+			// ignore meta-repo
+			if isMetaRepo(v.Node.Repository) {
+				continue
+			}
+			if v.Node.Repository.IsPrivate {
+				continue
+			}
+
+			pullRequests = append(pullRequests, pullRequestFromQL(v.Node))
+			if len(pullRequests) == count {
+				return pullRequests
+			}
+		}
+
+		pageInfo := recentPullRequestsQuery.User.PullRequests.PageInfo
+		if !pageInfo.HasNextPage {
 			break
 		}
+		after = githubv4.NewString(pageInfo.EndCursor)
+		// the first page was not enough, so do not go on in small steps
+		pageSize = maxPageSize
 	}
 
 	// fmt.Printf("Found %d pullRequests!\n", len(pullRequests))
@@ -258,58 +302,56 @@ func recentPullRequests(count int) []PullRequest {
 
 func recentRepos(count int) []Repo {
 	// fmt.Printf("Finding recently created repos...\n")
-
-	var repos []Repo
-	variables := map[string]interface{}{
-		"username": githubv4.String(username),
-		"count":    githubv4.Int(count + 1), // +1 in case we encounter the meta-repo itself
-		"isFork":   githubv4.Boolean(false),
-	}
-	err := gitHubClient.Query(context.Background(), &recentReposQuery, variables)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, v := range recentReposQuery.User.Repositories.Edges {
-		// ignore meta-repo
-		if string(v.Node.NameWithOwner) == fmt.Sprintf("%s/%s", username, username) {
-			continue
-		}
-
-		repos = append(repos, repoFromQL(v.Node))
-		if len(repos) == count {
-			break
-		}
-	}
-
-	// fmt.Printf("Found %d repos!\n", len(repos))
-	return repos
+	return recentOwnedRepos(count, false)
 }
 
 func recentForks(count int) []Repo {
-	// fmt.Printf("Finding recently created repos...\n")
+	// fmt.Printf("Finding recently created forks...\n")
+	return recentOwnedRepos(count, true)
+}
 
+// recentOwnedRepos returns the count most recently created public
+// repositories of the user, either the forks or the repositories that are
+// not forks, without the meta-repo. Like recentPullRequests it fetches
+// further pages until it has count repositories or none are left.
+func recentOwnedRepos(count int, isFork bool) []Repo {
 	var repos []Repo
-	variables := map[string]interface{}{
-		"username": githubv4.String(username),
-		"count":    githubv4.Int(count + 1), // +1 in case we encounter the meta-repo itself
-		"isFork":   githubv4.Boolean(true),
-	}
-	err := gitHubClient.Query(context.Background(), &recentReposQuery, variables)
-	if err != nil {
-		panic(err)
+	if count <= 0 {
+		return repos
 	}
 
-	for _, v := range recentReposQuery.User.Repositories.Edges {
-		// ignore meta-repo
-		if string(v.Node.NameWithOwner) == fmt.Sprintf("%s/%s", username, username) {
-			continue
+	var after *githubv4.String
+	pageSize := firstPageSize(count)
+	for {
+		variables := map[string]interface{}{
+			"username": githubv4.String(username),
+			"count":    githubv4.Int(pageSize),
+			"after":    after,
+			"isFork":   githubv4.Boolean(isFork),
+		}
+		err := gitHubClient.Query(context.Background(), &recentReposQuery, variables)
+		if err != nil {
+			panic(err)
 		}
 
-		repos = append(repos, repoFromQL(v.Node))
-		if len(repos) == count {
+		for _, v := range recentReposQuery.User.Repositories.Edges {
+			// ignore meta-repo
+			if isMetaRepo(v.Node) {
+				continue
+			}
+
+			repos = append(repos, repoFromQL(v.Node))
+			if len(repos) == count {
+				return repos
+			}
+		}
+
+		pageInfo := recentReposQuery.User.Repositories.PageInfo
+		if !pageInfo.HasNextPage {
 			break
 		}
+		after = githubv4.NewString(pageInfo.EndCursor)
+		pageSize = maxPageSize
 	}
 
 	// fmt.Printf("Found %d repos!\n", len(repos))

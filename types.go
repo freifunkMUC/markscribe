@@ -74,6 +74,11 @@ type qlGist struct {
 	CreatedAt   githubv4.DateTime
 }
 
+type qlPageInfo struct {
+	HasNextPage githubv4.Boolean
+	EndCursor   githubv4.String
+}
+
 type qlPullRequest struct {
 	URL        githubv4.String
 	Title      githubv4.String

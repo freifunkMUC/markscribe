@@ -370,3 +370,133 @@ func TestRepo(t *testing.T) {
 		t.Errorf("got release %+v, want v1.0.0", got.LastRelease)
 	}
 }
+
+func fakePullRequest(number int, repo obj) obj {
+	return obj{
+		"url":        fmt.Sprintf("https://example.org/pull/%d", number),
+		"title":      fmt.Sprintf("Pull request %d", number),
+		"state":      "OPEN",
+		"createdAt":  "2026-10-01T00:00:00Z",
+		"repository": repo,
+	}
+}
+
+func pullRequestTitles(pullRequests []PullRequest) string {
+	var titles []string
+	for _, pr := range pullRequests {
+		titles = append(titles, strings.TrimPrefix(pr.Title, "Pull request "))
+	}
+	return strings.Join(titles, " ")
+}
+
+func TestFirstPageSize(t *testing.T) {
+	for count, want := range map[int]int{1: 2, 10: 11, 99: 100, 100: 100, 250: 100} {
+		if got := firstPageSize(count); got != want {
+			t.Errorf("firstPageSize(%d) = %d, want %d", count, got, want)
+		}
+	}
+}
+
+func TestRecentPullRequests(t *testing.T) {
+	public := fakeRepo("org/public")
+	private := with(fakeRepo("org/private"), "isPrivate", true)
+	meta := fakeRepo("octocat/octocat")
+
+	// Most of the recent pull requests cannot be shown. Asking for count+1
+	// of them, as it used to be, finds too few (muesli/markscribe#90).
+	var all list
+	for i := 1; i <= 130; i++ {
+		switch {
+		case i%2 == 0:
+			all = append(all, fakePullRequest(i, private))
+		case i%3 == 0:
+			all = append(all, fakePullRequest(i, meta))
+		default:
+			all = append(all, fakePullRequest(i, public))
+		}
+	}
+
+	requests := fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"user": obj{"pullRequests": fakePage(t, req, all)}}
+	})
+
+	got := recentPullRequests(5)
+	if titles := pullRequestTitles(got); titles != "1 5 7 11 13" {
+		t.Errorf("got pull requests %s, want 1 5 7 11 13", titles)
+	}
+	if got[0].Repo.Name != "org/public" || got[0].State != "OPEN" || got[0].URL != "https://example.org/pull/1" {
+		t.Errorf("pull request fields are not filled in: %+v", got[0])
+	}
+	if len(*requests) != 2 {
+		t.Errorf("got %d queries, want 2", len(*requests))
+	}
+
+	// more than there are: everything that can be shown, and an end
+	*requests = nil
+	if got := recentPullRequests(100); len(got) != 43 {
+		t.Errorf("got %d pull requests, want all 43 public ones", len(got))
+	}
+	if len(*requests) != 2 {
+		t.Errorf("got %d queries, want 2", len(*requests))
+	}
+
+	// enough on the first page: a single query
+	*requests = nil
+	if titles := pullRequestTitles(recentPullRequests(1)); titles != "1" {
+		t.Errorf("got pull requests %s, want 1", titles)
+	}
+	if len(*requests) != 1 {
+		t.Errorf("got %d queries, want 1", len(*requests))
+	}
+
+	*requests = nil
+	if got := recentPullRequests(0); len(got) != 0 || len(*requests) != 0 {
+		t.Errorf("got %d pull requests and %d queries for a count of 0", len(got), len(*requests))
+	}
+}
+
+func TestRecentPullRequestsWithoutAny(t *testing.T) {
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"user": obj{"pullRequests": fakePage(t, req, nil)}}
+	})
+
+	if got := recentPullRequests(5); len(got) != 0 {
+		t.Errorf("got %d pull requests, want none", len(got))
+	}
+}
+
+func repoNames(repos []Repo) string {
+	var names []string
+	for _, r := range repos {
+		names = append(names, r.Name)
+	}
+	return strings.Join(names, " ")
+}
+
+func TestRecentReposAndForks(t *testing.T) {
+	repos := list{fakeRepo("octocat/octocat"), fakeRepo("octocat/a"), fakeRepo("octocat/b"), fakeRepo("octocat/c")}
+	forks := list{fakeRepo("octocat/fork-a"), fakeRepo("octocat/fork-b")}
+
+	requests := fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		if req.Variables["isFork"].(bool) {
+			return obj{"user": obj{"repositories": fakePage(t, req, forks)}}
+		}
+		return obj{"user": obj{"repositories": fakePage(t, req, repos)}}
+	})
+
+	if got := repoNames(recentRepos(2)); got != "octocat/a octocat/b" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b", got)
+	}
+	if got := repoNames(recentRepos(10)); got != "octocat/a octocat/b octocat/c" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b octocat/c", got)
+	}
+	if got := repoNames(recentForks(1)); got != "octocat/fork-a" {
+		t.Errorf("got forks %q, want octocat/fork-a", got)
+	}
+	if got := repoNames(recentForks(10)); got != "octocat/fork-a octocat/fork-b" {
+		t.Errorf("got forks %q, want octocat/fork-a octocat/fork-b", got)
+	}
+	if len(*requests) != 4 {
+		t.Errorf("got %d queries, want one per call (4)", len(*requests))
+	}
+}
