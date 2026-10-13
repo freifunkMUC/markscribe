@@ -500,3 +500,30 @@ func TestRecentReposAndForks(t *testing.T) {
 		t.Errorf("got %d queries, want one per call (4)", len(*requests))
 	}
 }
+
+func TestRecentReposSkipsArchived(t *testing.T) {
+	archived := func(name string) obj { return with(fakeRepo(name), "isArchived", true) }
+	repos := list{archived("octocat/old-a"), fakeRepo("octocat/a"), archived("octocat/old-b"), archived("octocat/old-c"), fakeRepo("octocat/b")}
+	forks := list{archived("octocat/old-fork"), fakeRepo("octocat/fork")}
+
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		if req.Variables["isFork"].(bool) {
+			return obj{"user": obj{"repositories": fakePage(t, req, forks)}}
+		}
+		return obj{"user": obj{"repositories": fakePage(t, req, repos)}}
+	})
+
+	// archived repositories do not count towards the requested number
+	if got := repoNames(recentRepos(2)); got != "octocat/a octocat/b" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b", got)
+	}
+
+	// forks keep them, and say so
+	got := recentForks(2)
+	if names := repoNames(got); names != "octocat/old-fork octocat/fork" {
+		t.Fatalf("got forks %q, want octocat/old-fork octocat/fork", names)
+	}
+	if !got[0].IsArchived || got[1].IsArchived {
+		t.Errorf("IsArchived is %v and %v, want true and false", got[0].IsArchived, got[1].IsArchived)
+	}
+}

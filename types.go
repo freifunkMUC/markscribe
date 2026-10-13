@@ -49,6 +49,7 @@ type Repo struct {
 	URL         string
 	Description string
 	IsPrivate   bool
+	IsArchived  bool
 	Stargazers  int
 	LastRelease Release
 }
@@ -105,6 +106,7 @@ type qlRepository struct {
 	URL           githubv4.String
 	Description   githubv4.String
 	IsPrivate     githubv4.Boolean
+	IsArchived    githubv4.Boolean
 	Stargazers    struct {
 		TotalCount githubv4.Int
 	}
@@ -168,6 +170,7 @@ func repoFromQL(repo qlRepository) Repo {
 		Description: string(repo.Description),
 		Stargazers:  int(repo.Stargazers.TotalCount),
 		IsPrivate:   bool(repo.IsPrivate),
+		IsArchived:  bool(repo.IsArchived),
 	}
 }
 

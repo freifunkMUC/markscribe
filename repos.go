@@ -88,6 +88,7 @@ var repoQuery struct {
 		Description   githubv4.String
 		NameWithOwner githubv4.String
 		IsPrivate     githubv4.Boolean
+		IsArchived    githubv4.Boolean
 		URL           githubv4.String
 		Stargazers    struct {
 			TotalCount githubv4.Int
@@ -300,21 +301,25 @@ func recentPullRequests(count int) []PullRequest {
 	return pullRequests
 }
 
+// recentRepos returns the count most recently created public repositories
+// of the user that are neither forks nor archived.
 func recentRepos(count int) []Repo {
 	// fmt.Printf("Finding recently created repos...\n")
-	return recentOwnedRepos(count, false)
+	return recentOwnedRepos(count, false, false)
 }
 
+// recentForks returns the count most recently created public forks of the
+// user, archived ones included.
 func recentForks(count int) []Repo {
 	// fmt.Printf("Finding recently created forks...\n")
-	return recentOwnedRepos(count, true)
+	return recentOwnedRepos(count, true, true)
 }
 
 // recentOwnedRepos returns the count most recently created public
 // repositories of the user, either the forks or the repositories that are
 // not forks, without the meta-repo. Like recentPullRequests it fetches
 // further pages until it has count repositories or none are left.
-func recentOwnedRepos(count int, isFork bool) []Repo {
+func recentOwnedRepos(count int, isFork, includeArchived bool) []Repo {
 	var repos []Repo
 	if count <= 0 {
 		return repos
@@ -337,6 +342,10 @@ func recentOwnedRepos(count int, isFork bool) []Repo {
 		for _, v := range recentReposQuery.User.Repositories.Edges {
 			// ignore meta-repo
 			if isMetaRepo(v.Node) {
+				continue
+			}
+			// ignore archived
+			if bool(v.Node.IsArchived) && !includeArchived {
 				continue
 			}
 
@@ -453,6 +462,7 @@ func repo(owner, name string) Repo {
 		Description: string(repo.Description),
 		Stargazers:  int(repo.Stargazers.TotalCount),
 		IsPrivate:   bool(repo.IsPrivate),
+		IsArchived:  bool(repo.IsArchived),
 	}
 	// a repository without releases keeps an empty LastRelease
 	if len(repo.Releases.Nodes) > 0 {

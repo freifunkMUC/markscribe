@@ -119,6 +119,8 @@ Stars: {{.Stargazers}}
 {{end}}
 ```
 
+Forks and archived repositories are not listed.
+
 This function requires GitHub authentication with the following API scopes:
 `repo:status`, `public_repo`, `read:user`.
 
@@ -131,6 +133,7 @@ Description: {{.Description}}
 URL: {{.URL}}
 Stars: {{.Stargazers}}
 Is Private: {{.IsPrivate}}
+Is Archived: {{.IsArchived}}
 Last Git Tag: {{.LastRelease.TagName}}
 Last Release: {{humanize .LastRelease.PublishedAt}}
 {{end}}
@@ -148,6 +151,15 @@ Description: {{.Description}}
 URL: {{.URL}})
 Stars: {{.Stargazers}}
 {{end}}
+```
+
+Archived forks are listed. Every repository, here and in the other functions,
+has the field `IsArchived`, so a template can leave them out:
+
+```
+{{range recentForks 10}}{{if not .IsArchived}}
+Name: {{.Name}}
+{{end}}{{end}}
 ```
 
 This function requires GitHub authentication with the following API scopes:
