@@ -1,29 +1,36 @@
-name: build
-on: [push, pull_request]
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
 
 jobs:
   build:
-    strategy:
-      matrix:
-        go-version: [~1.16, ^1]
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      GO111MODULE: "on"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v4
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: ${{ matrix.go-version }}
-
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Download Go modules
-        run: go mod download
+          go-version-file: go.mod
 
       - name: Build
-        run: go build -v ./...
+        run: go build -o markscribe .
 
-      - name: Test
-        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+
+      # A template without calls to the GitHub API needs no token.
+      - name: Render a template
+        run: |
+          ./markscribe -write test/static.md test/static.md.tpl
+          test "$(cat test/static.md)" = "Rendered by markscribe."
