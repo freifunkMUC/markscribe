@@ -164,6 +164,13 @@ Published: {{humanize .LastRelease.PublishedAt}}
 {{end}}
 ```
 
+This lists the public repositories you committed to during the past year,
+each with its latest release, sorted by the date of that release. Drafts and
+pre-releases are not counted as releases. Whether a commit of yours is part
+of that release is not checked: GitHub's API offers no reliable way to find
+out, so a repository also shows up when your commits are still waiting for
+the next release.
+
 This function requires GitHub authentication with the following API scopes:
 `repo:status`, `public_repo`, `read:user`.
 

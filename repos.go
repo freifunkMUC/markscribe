@@ -371,24 +371,14 @@ func recentReleases(count int) []Repo {
 
 	var repos []Repo
 	for _, c := range contributions {
+		rel, ok := latestRelease(releases[c.ID])
+		if !ok {
+			continue
+		}
+
 		r := repoFromQL(c.Repository)
-		rels := releases[c.ID]
-
-		for _, rel := range rels.Nodes {
-			if rel.IsPrerelease || rel.IsDraft {
-				continue
-			}
-			if rels.Nodes[0].TagName == "" ||
-				rels.Nodes[0].PublishedAt.Time.IsZero() {
-				continue
-			}
-			r.LastRelease = releaseFromQL(rels)
-			break
-		}
-
-		if !r.LastRelease.PublishedAt.IsZero() {
-			repos = append(repos, r)
-		}
+		r.LastRelease = rel
+		repos = append(repos, r)
 	}
 
 	sort.Slice(repos, func(i, j int) bool {
@@ -415,14 +405,18 @@ func repo(owner, name string) Repo {
 		panic(err)
 	}
 	repo := repoQuery.Repository
-	return Repo{
+	r := Repo{
 		Name:        string(repo.NameWithOwner),
 		URL:         string(repo.URL),
 		Description: string(repo.Description),
 		Stargazers:  int(repo.Stargazers.TotalCount),
 		IsPrivate:   bool(repo.IsPrivate),
-		LastRelease: releaseFromQL(repo.Releases),
 	}
+	// a repository without releases keeps an empty LastRelease
+	if len(repo.Releases.Nodes) > 0 {
+		r.LastRelease = releaseFromQL(repo.Releases.Nodes[0])
+	}
+	return r
 }
 
 /*

@@ -83,14 +83,16 @@ type qlPullRequest struct {
 }
 
 type qlRelease struct {
-	Nodes []struct {
-		Name         githubv4.String
-		TagName      githubv4.String
-		PublishedAt  githubv4.DateTime
-		URL          githubv4.String
-		IsPrerelease githubv4.Boolean
-		IsDraft      githubv4.Boolean
-	}
+	Nodes []qlReleaseNode
+}
+
+type qlReleaseNode struct {
+	Name         githubv4.String
+	TagName      githubv4.String
+	PublishedAt  githubv4.DateTime
+	URL          githubv4.String
+	IsPrerelease githubv4.Boolean
+	IsDraft      githubv4.Boolean
 }
 
 type qlRepository struct {
@@ -129,13 +131,29 @@ func pullRequestFromQL(pullRequest qlPullRequest) PullRequest {
 	}
 }
 
-func releaseFromQL(release qlRelease) Release {
+func releaseFromQL(release qlReleaseNode) Release {
 	return Release{
-		Name:        string(release.Nodes[0].Name),
-		TagName:     string(release.Nodes[0].TagName),
-		PublishedAt: release.Nodes[0].PublishedAt.Time,
-		URL:         string(release.Nodes[0].URL),
+		Name:        string(release.Name),
+		TagName:     string(release.TagName),
+		PublishedAt: release.PublishedAt.Time,
+		URL:         string(release.URL),
 	}
+}
+
+// latestRelease returns the first release in the list that is published and
+// not a pre-release. The list is expected to start with the newest release.
+func latestRelease(releases qlRelease) (Release, bool) {
+	for _, rel := range releases.Nodes {
+		if rel.IsPrerelease || rel.IsDraft {
+			continue
+		}
+		if rel.TagName == "" || rel.PublishedAt.Time.IsZero() {
+			continue
+		}
+		return releaseFromQL(rel), true
+	}
+
+	return Release{}, false
 }
 
 func repoFromQL(repo qlRepository) Repo {

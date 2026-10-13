@@ -273,3 +273,100 @@ func TestRecentReleasesBatches(t *testing.T) {
 		t.Errorf("got batches of %v, want %v", batches, want)
 	}
 }
+
+func TestLatestRelease(t *testing.T) {
+	published := githubv4.DateTime{Time: time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)}
+	stable := qlReleaseNode{Name: "Stable", TagName: "v1.0.0", PublishedAt: published, URL: "https://example.org/v1.0.0"}
+	older := qlReleaseNode{TagName: "v0.9.0", PublishedAt: published}
+	draft := qlReleaseNode{TagName: "v1.1.0", IsDraft: true}
+	untaggedDraft := qlReleaseNode{IsDraft: true}
+	prerelease := qlReleaseNode{TagName: "v1.1.0-rc1", PublishedAt: published, IsPrerelease: true}
+	unpublished := qlReleaseNode{TagName: "v1.2.0"}
+	untagged := qlReleaseNode{PublishedAt: published}
+
+	tests := []struct {
+		name  string
+		nodes []qlReleaseNode
+		want  string // tag of the expected release, empty for none
+	}{
+		{"no releases", nil, ""},
+		{"stable first", []qlReleaseNode{stable, older}, "v1.0.0"},
+		{"draft first", []qlReleaseNode{draft, stable}, "v1.0.0"},
+		{"draft without tag first", []qlReleaseNode{untaggedDraft, stable}, "v1.0.0"},
+		{"pre-release first", []qlReleaseNode{prerelease, stable}, "v1.0.0"},
+		{"draft and pre-release first", []qlReleaseNode{draft, prerelease, stable, older}, "v1.0.0"},
+		{"only drafts and pre-releases", []qlReleaseNode{draft, prerelease}, ""},
+		{"without publication date or tag", []qlReleaseNode{unpublished, untagged, older}, "v0.9.0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := latestRelease(qlRelease{Nodes: tt.nodes})
+			if ok != (tt.want != "") {
+				t.Fatalf("found = %v, want %v", ok, tt.want != "")
+			}
+			if got.TagName != tt.want {
+				t.Errorf("got %q, want %q", got.TagName, tt.want)
+			}
+		})
+	}
+
+	got, _ := latestRelease(qlRelease{Nodes: []qlReleaseNode{draft, stable}})
+	want := Release{Name: "Stable", TagName: "v1.0.0", PublishedAt: published.Time, URL: "https://example.org/v1.0.0"}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestRecentReleasesSkipsDraftsAndPrereleases(t *testing.T) {
+	fakeContributions(t, []list{
+		{
+			fakeContribution("org/draft-first", "2026-10-10T07:00:00Z"),
+			fakeContribution("org/prerelease-first", "2026-10-09T07:00:00Z"),
+			fakeContribution("org/only-prerelease", "2026-10-08T07:00:00Z"),
+		},
+		{},
+	}, map[string]list{
+		"org/draft-first": {
+			with(with(fakeRelease("v2.0.0", ""), "publishedAt", nil), "isDraft", true),
+			fakeRelease("v1.0.0", "2026-03-01T00:00:00Z"),
+		},
+		"org/prerelease-first": {
+			with(fakeRelease("v3.0.0-rc1", "2026-09-01T00:00:00Z"), "isPrerelease", true),
+			fakeRelease("v2.5.0", "2026-08-01T00:00:00Z"),
+		},
+		"org/only-prerelease": {
+			with(fakeRelease("v0.1.0-beta", "2026-09-01T00:00:00Z"), "isPrerelease", true),
+		},
+	})
+
+	var names []string
+	for _, r := range recentReleases(10) {
+		names = append(names, r.Name+"@"+r.LastRelease.TagName)
+	}
+	want := "org/prerelease-first@v2.5.0 org/draft-first@v1.0.0"
+	if strings.Join(names, " ") != want {
+		t.Errorf("got %v, want %s", names, want)
+	}
+}
+
+func TestRepo(t *testing.T) {
+	releases := list{}
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"repository": with(fakeRepo(req.Variables["owner"].(string)+"/"+req.Variables["name"].(string)),
+			"releases", obj{"nodes": releases})}
+	})
+
+	got := repo("org", "no-release")
+	if got.Name != "org/no-release" || got.Stargazers != 1 {
+		t.Errorf("repository fields are not filled in: %+v", got)
+	}
+	if got.LastRelease != (Release{}) {
+		t.Errorf("got release %+v for a repository without releases", got.LastRelease)
+	}
+
+	releases = list{fakeRelease("v1.0.0", "2026-03-01T00:00:00Z")}
+	if got := repo("org", "released"); got.LastRelease.TagName != "v1.0.0" {
+		t.Errorf("got release %+v, want v1.0.0", got.LastRelease)
+	}
+}
