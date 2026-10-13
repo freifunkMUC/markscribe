@@ -1,0 +1,529 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/shurcooL/githubv4"
+)
+
+func contribution(name string, occurredAt string) repoContribution {
+	t, err := time.Parse(time.RFC3339, occurredAt)
+	if err != nil {
+		panic(err)
+	}
+	return repoContribution{
+		ID:         "id-" + name,
+		Repository: qlRepository{NameWithOwner: githubv4.String(name)},
+		OccurredAt: t,
+	}
+}
+
+func TestWindowsBefore(t *testing.T) {
+	now := time.Date(2026, time.October, 13, 12, 0, 0, 0, time.UTC)
+	windows := windowsBefore(now, 2, 6)
+
+	if len(windows) != 2 {
+		t.Fatalf("got %d windows, want 2", len(windows))
+	}
+	if !windows[0].To.Equal(now) {
+		t.Errorf("first window ends at %s, want %s", windows[0].To, now)
+	}
+	if !windows[0].From.Equal(windows[1].To) {
+		t.Errorf("windows are not consecutive: %s and %s", windows[0].From, windows[1].To)
+	}
+	want := time.Date(2025, time.October, 13, 12, 0, 0, 0, time.UTC)
+	if !windows[1].From.Equal(want) {
+		t.Errorf("last window starts at %s, want %s", windows[1].From, want)
+	}
+	for _, w := range windows {
+		if !w.From.Before(w.To) {
+			t.Errorf("window %s to %s is empty", w.From, w.To)
+		}
+	}
+}
+
+func TestMergeContributions(t *testing.T) {
+	merged := mergeContributions(nil, []repoContribution{
+		contribution("a/a", "2026-10-01T00:00:00Z"),
+		contribution("b/b", "2026-09-01T00:00:00Z"),
+	})
+	merged = mergeContributions(merged, []repoContribution{
+		contribution("b/b", "2026-09-15T00:00:00Z"), // newer than the known one
+		contribution("a/a", "2026-01-01T00:00:00Z"), // older than the known one
+		contribution("c/c", "2026-02-01T00:00:00Z"),
+	})
+
+	got := map[string]string{}
+	for _, c := range merged {
+		got[string(c.Repository.NameWithOwner)] = c.OccurredAt.Format("2006-01-02")
+	}
+	want := map[string]string{
+		"a/a": "2026-10-01",
+		"b/b": "2026-09-15",
+		"c/c": "2026-02-01",
+	}
+	if len(merged) != len(want) {
+		t.Fatalf("got %d repositories, want %d: %v", len(merged), len(want), got)
+	}
+	for name, day := range want {
+		if got[name] != day {
+			t.Errorf("%s: got %q, want %q", name, got[name], day)
+		}
+	}
+}
+
+// fakeContributions answers the contributions query with one set of
+// repositories per window, most recent window first, and the releases
+// query from the given releases per repository name. Windows that are not
+// given have no contributions.
+func fakeContributions(t *testing.T, windows []list, releases map[string]list) *[]graphQLRequest {
+	t.Helper()
+
+	window := 0
+	return fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		switch {
+		case strings.Contains(req.Query, "contributionsCollection"):
+			if window >= contributionWindows {
+				t.Errorf("unexpected contributions query number %d", window+1)
+			}
+			repos := list{}
+			if window < len(windows) {
+				repos = windows[window]
+			}
+			window++
+			return obj{"user": obj{"contributionsCollection": obj{"commitContributionsByRepository": repos}}}
+
+		case strings.Contains(req.Query, "nodes(ids: $ids)"):
+			nodes := list{}
+			for _, id := range req.Variables["ids"].([]interface{}) {
+				name := strings.TrimPrefix(id.(string), "id-")
+				nodes = append(nodes, obj{"id": id, "releases": obj{"nodes": releases[name]}})
+			}
+			return obj{"nodes": nodes}
+		}
+
+		t.Errorf("unexpected query: %s", req.Query)
+		return obj{}
+	})
+}
+
+func fakeContribution(name, occurredAt string) obj {
+	return obj{
+		"contributions": obj{"edges": list{obj{"cursor": "c", "node": obj{"occurredAt": occurredAt}}}},
+		"repository":    with(fakeRepo(name), "id", "id-"+name),
+	}
+}
+
+func fakeRelease(tag, publishedAt string) obj {
+	return obj{
+		"name":         "Release " + tag,
+		"tagName":      tag,
+		"publishedAt":  publishedAt,
+		"url":          "https://example.org/releases/" + tag,
+		"isPrerelease": false,
+		"isDraft":      false,
+	}
+}
+
+func TestRecentContributions(t *testing.T) {
+	requests := fakeContributions(t, []list{
+		{
+			fakeContribution("octocat/octocat", "2026-10-12T07:00:00Z"), // the profile repository
+			fakeContribution("org/newer", "2026-10-10T07:00:00Z"),
+			with(fakeContribution("org/secret", "2026-10-09T07:00:00Z"), "repository",
+				with(with(fakeRepo("org/secret"), "id", "id-org/secret"), "isPrivate", true)),
+			fakeContribution("org/both", "2026-08-01T07:00:00Z"),
+			// the same day as org/newer: sorted by name
+			fakeContribution("org/alike", "2026-10-10T07:00:00Z"),
+			// a repository without a visible contribution must not crash
+			with(fakeContribution("org/empty", "2026-08-01T07:00:00Z"), "contributions", obj{"edges": list{}}),
+		},
+		{
+			fakeContribution("org/both", "2026-01-01T07:00:00Z"),
+			fakeContribution("org/older", "2025-12-01T07:00:00Z"),
+		},
+	}, nil)
+
+	got := recentContributions(10)
+
+	var names []string
+	for _, c := range got {
+		names = append(names, c.Repo.Name)
+	}
+	want := "org/alike org/newer org/both org/older"
+	if strings.Join(names, " ") != want {
+		t.Fatalf("got %v, want %s", names, want)
+	}
+	if day := got[2].OccurredAt.Format("2006-01-02"); day != "2026-08-01" {
+		t.Errorf("org/both occurred at %s, want the most recent contribution 2026-08-01", day)
+	}
+	if got[1].Repo.URL != "https://github.com/org/newer" || got[1].Repo.Description != "about org/newer" {
+		t.Errorf("repository fields are not filled in: %+v", got[1].Repo)
+	}
+
+	if len(*requests) != contributionWindows {
+		t.Fatalf("got %d queries, want one per window (%d)", len(*requests), contributionWindows)
+	}
+	for i, req := range *requests {
+		from, err := time.Parse(time.RFC3339, req.Variables["from"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		to, err := time.Parse(time.RFC3339, req.Variables["to"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		days := to.Sub(from).Hours() / 24
+		if want := float64(contributionWindowMonths) * 30.5; days < want-5 || days > want+5 {
+			t.Errorf("query %d asks for %.0f days, want about %.0f", i+1, days, want)
+		}
+		if i > 0 && req.Variables["to"] != (*requests)[i-1].Variables["from"] {
+			t.Errorf("query %d does not continue where query %d began", i+1, i)
+		}
+	}
+
+	if got := recentContributions(2); len(got) != 2 {
+		t.Errorf("got %d contributions, want 2", len(got))
+	}
+	if len(*requests) != contributionWindows {
+		t.Errorf("a second call asked GitHub again: %d queries", len(*requests))
+	}
+}
+
+func TestRecentReleases(t *testing.T) {
+	requests := fakeContributions(t, []list{
+		{
+			fakeContribution("org/old-release", "2026-10-10T07:00:00Z"),
+			fakeContribution("org/no-release", "2026-10-09T07:00:00Z"),
+			with(fakeContribution("org/secret", "2026-10-09T07:00:00Z"), "repository",
+				with(with(fakeRepo("org/secret"), "id", "id-org/secret"), "isPrivate", true)),
+		},
+		{
+			fakeContribution("org/new-release", "2026-01-01T07:00:00Z"),
+		},
+	}, map[string]list{
+		"org/old-release": {fakeRelease("v1.1.0", "2026-03-01T00:00:00Z"), fakeRelease("v1.0.0", "2026-02-01T00:00:00Z")},
+		"org/new-release": {fakeRelease("v2.0.0", "2026-09-01T00:00:00Z")},
+		"org/secret":      {fakeRelease("v9.0.0", "2026-10-01T00:00:00Z")},
+	})
+
+	got := recentReleases(10)
+
+	var names []string
+	for _, r := range got {
+		names = append(names, r.Name+"@"+r.LastRelease.TagName)
+	}
+	want := "org/new-release@v2.0.0 org/old-release@v1.1.0"
+	if strings.Join(names, " ") != want {
+		t.Fatalf("got %v, want %s", names, want)
+	}
+	if got[0].LastRelease.URL != "https://example.org/releases/v2.0.0" || got[0].LastRelease.Name != "Release v2.0.0" {
+		t.Errorf("release fields are not filled in: %+v", got[0].LastRelease)
+	}
+	if got[0].Description != "about org/new-release" {
+		t.Errorf("repository fields are not filled in: %+v", got[0])
+	}
+
+	// one query per window and one for the releases of all repositories
+	if len(*requests) != contributionWindows+1 {
+		t.Fatalf("got %d queries, want %d", len(*requests), contributionWindows+1)
+	}
+	last := (*requests)[len(*requests)-1]
+	if !strings.Contains(last.Query, "$ids:[ID!]!") {
+		t.Errorf("the releases query does not declare a list of IDs: %s", last.Query)
+	}
+	for _, id := range last.Variables["ids"].([]interface{}) {
+		if id == "id-org/secret" {
+			t.Errorf("asked for the releases of a private repository")
+		}
+	}
+
+	if got := recentReleases(1); len(got) != 1 || got[0].Name != "org/new-release" {
+		t.Errorf("got %+v, want only org/new-release", got)
+	}
+}
+
+func TestRecentReleasesBatches(t *testing.T) {
+	var window list
+	releases := map[string]list{}
+	total := releaseBatchSize*2 + 1
+	for i := 0; i < total; i++ {
+		name := fmt.Sprintf("org/repo-%03d", i)
+		day := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i).Format(time.RFC3339)
+		window = append(window, fakeContribution(name, day))
+		releases[name] = list{fakeRelease("v1", day)}
+	}
+	requests := fakeContributions(t, []list{window, {}}, releases)
+
+	if got := recentReleases(total + 1); len(got) != total {
+		t.Fatalf("got %d repositories, want %d", len(got), total)
+	}
+
+	var batches []int
+	for _, req := range *requests {
+		if ids, ok := req.Variables["ids"].([]interface{}); ok {
+			batches = append(batches, len(ids))
+		}
+	}
+	want := []int{releaseBatchSize, releaseBatchSize, 1}
+	if fmt.Sprint(batches) != fmt.Sprint(want) {
+		t.Errorf("got batches of %v, want %v", batches, want)
+	}
+}
+
+func TestLatestRelease(t *testing.T) {
+	published := githubv4.DateTime{Time: time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)}
+	stable := qlReleaseNode{Name: "Stable", TagName: "v1.0.0", PublishedAt: published, URL: "https://example.org/v1.0.0"}
+	older := qlReleaseNode{TagName: "v0.9.0", PublishedAt: published}
+	draft := qlReleaseNode{TagName: "v1.1.0", IsDraft: true}
+	untaggedDraft := qlReleaseNode{IsDraft: true}
+	prerelease := qlReleaseNode{TagName: "v1.1.0-rc1", PublishedAt: published, IsPrerelease: true}
+	unpublished := qlReleaseNode{TagName: "v1.2.0"}
+	untagged := qlReleaseNode{PublishedAt: published}
+
+	tests := []struct {
+		name  string
+		nodes []qlReleaseNode
+		want  string // tag of the expected release, empty for none
+	}{
+		{"no releases", nil, ""},
+		{"stable first", []qlReleaseNode{stable, older}, "v1.0.0"},
+		{"draft first", []qlReleaseNode{draft, stable}, "v1.0.0"},
+		{"draft without tag first", []qlReleaseNode{untaggedDraft, stable}, "v1.0.0"},
+		{"pre-release first", []qlReleaseNode{prerelease, stable}, "v1.0.0"},
+		{"draft and pre-release first", []qlReleaseNode{draft, prerelease, stable, older}, "v1.0.0"},
+		{"only drafts and pre-releases", []qlReleaseNode{draft, prerelease}, ""},
+		{"without publication date or tag", []qlReleaseNode{unpublished, untagged, older}, "v0.9.0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := latestRelease(qlRelease{Nodes: tt.nodes})
+			if ok != (tt.want != "") {
+				t.Fatalf("found = %v, want %v", ok, tt.want != "")
+			}
+			if got.TagName != tt.want {
+				t.Errorf("got %q, want %q", got.TagName, tt.want)
+			}
+		})
+	}
+
+	got, _ := latestRelease(qlRelease{Nodes: []qlReleaseNode{draft, stable}})
+	want := Release{Name: "Stable", TagName: "v1.0.0", PublishedAt: published.Time, URL: "https://example.org/v1.0.0"}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestRecentReleasesSkipsDraftsAndPrereleases(t *testing.T) {
+	fakeContributions(t, []list{
+		{
+			fakeContribution("org/draft-first", "2026-10-10T07:00:00Z"),
+			fakeContribution("org/prerelease-first", "2026-10-09T07:00:00Z"),
+			fakeContribution("org/only-prerelease", "2026-10-08T07:00:00Z"),
+		},
+		{},
+	}, map[string]list{
+		"org/draft-first": {
+			with(with(fakeRelease("v2.0.0", ""), "publishedAt", nil), "isDraft", true),
+			fakeRelease("v1.0.0", "2026-03-01T00:00:00Z"),
+		},
+		"org/prerelease-first": {
+			with(fakeRelease("v3.0.0-rc1", "2026-09-01T00:00:00Z"), "isPrerelease", true),
+			fakeRelease("v2.5.0", "2026-08-01T00:00:00Z"),
+		},
+		"org/only-prerelease": {
+			with(fakeRelease("v0.1.0-beta", "2026-09-01T00:00:00Z"), "isPrerelease", true),
+		},
+	})
+
+	var names []string
+	for _, r := range recentReleases(10) {
+		names = append(names, r.Name+"@"+r.LastRelease.TagName)
+	}
+	want := "org/prerelease-first@v2.5.0 org/draft-first@v1.0.0"
+	if strings.Join(names, " ") != want {
+		t.Errorf("got %v, want %s", names, want)
+	}
+}
+
+func TestRepo(t *testing.T) {
+	releases := list{}
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"repository": with(fakeRepo(req.Variables["owner"].(string)+"/"+req.Variables["name"].(string)),
+			"releases", obj{"nodes": releases})}
+	})
+
+	got := repo("org", "no-release")
+	if got.Name != "org/no-release" || got.Stargazers != 1 {
+		t.Errorf("repository fields are not filled in: %+v", got)
+	}
+	if got.LastRelease != (Release{}) {
+		t.Errorf("got release %+v for a repository without releases", got.LastRelease)
+	}
+
+	releases = list{fakeRelease("v1.0.0", "2026-03-01T00:00:00Z")}
+	if got := repo("org", "released"); got.LastRelease.TagName != "v1.0.0" {
+		t.Errorf("got release %+v, want v1.0.0", got.LastRelease)
+	}
+}
+
+func fakePullRequest(number int, repo obj) obj {
+	return obj{
+		"url":        fmt.Sprintf("https://example.org/pull/%d", number),
+		"title":      fmt.Sprintf("Pull request %d", number),
+		"state":      "OPEN",
+		"createdAt":  "2026-10-01T00:00:00Z",
+		"repository": repo,
+	}
+}
+
+func pullRequestTitles(pullRequests []PullRequest) string {
+	var titles []string
+	for _, pr := range pullRequests {
+		titles = append(titles, strings.TrimPrefix(pr.Title, "Pull request "))
+	}
+	return strings.Join(titles, " ")
+}
+
+func TestFirstPageSize(t *testing.T) {
+	for count, want := range map[int]int{1: 2, 10: 11, 99: 100, 100: 100, 250: 100} {
+		if got := firstPageSize(count); got != want {
+			t.Errorf("firstPageSize(%d) = %d, want %d", count, got, want)
+		}
+	}
+}
+
+func TestRecentPullRequests(t *testing.T) {
+	public := fakeRepo("org/public")
+	private := with(fakeRepo("org/private"), "isPrivate", true)
+	meta := fakeRepo("octocat/octocat")
+
+	// Most of the recent pull requests cannot be shown. Asking for count+1
+	// of them, as it used to be, finds too few (muesli/markscribe#90).
+	var all list
+	for i := 1; i <= 130; i++ {
+		switch {
+		case i%2 == 0:
+			all = append(all, fakePullRequest(i, private))
+		case i%3 == 0:
+			all = append(all, fakePullRequest(i, meta))
+		default:
+			all = append(all, fakePullRequest(i, public))
+		}
+	}
+
+	requests := fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"user": obj{"pullRequests": fakePage(t, req, all)}}
+	})
+
+	got := recentPullRequests(5)
+	if titles := pullRequestTitles(got); titles != "1 5 7 11 13" {
+		t.Errorf("got pull requests %s, want 1 5 7 11 13", titles)
+	}
+	if got[0].Repo.Name != "org/public" || got[0].State != "OPEN" || got[0].URL != "https://example.org/pull/1" {
+		t.Errorf("pull request fields are not filled in: %+v", got[0])
+	}
+	if len(*requests) != 2 {
+		t.Errorf("got %d queries, want 2", len(*requests))
+	}
+
+	// more than there are: everything that can be shown, and an end
+	*requests = nil
+	if got := recentPullRequests(100); len(got) != 43 {
+		t.Errorf("got %d pull requests, want all 43 public ones", len(got))
+	}
+	if len(*requests) != 2 {
+		t.Errorf("got %d queries, want 2", len(*requests))
+	}
+
+	// enough on the first page: a single query
+	*requests = nil
+	if titles := pullRequestTitles(recentPullRequests(1)); titles != "1" {
+		t.Errorf("got pull requests %s, want 1", titles)
+	}
+	if len(*requests) != 1 {
+		t.Errorf("got %d queries, want 1", len(*requests))
+	}
+
+	*requests = nil
+	if got := recentPullRequests(0); len(got) != 0 || len(*requests) != 0 {
+		t.Errorf("got %d pull requests and %d queries for a count of 0", len(got), len(*requests))
+	}
+}
+
+func TestRecentPullRequestsWithoutAny(t *testing.T) {
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		return obj{"user": obj{"pullRequests": fakePage(t, req, nil)}}
+	})
+
+	if got := recentPullRequests(5); len(got) != 0 {
+		t.Errorf("got %d pull requests, want none", len(got))
+	}
+}
+
+func repoNames(repos []Repo) string {
+	var names []string
+	for _, r := range repos {
+		names = append(names, r.Name)
+	}
+	return strings.Join(names, " ")
+}
+
+func TestRecentReposAndForks(t *testing.T) {
+	repos := list{fakeRepo("octocat/octocat"), fakeRepo("octocat/a"), fakeRepo("octocat/b"), fakeRepo("octocat/c")}
+	forks := list{fakeRepo("octocat/fork-a"), fakeRepo("octocat/fork-b")}
+
+	requests := fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		if req.Variables["isFork"].(bool) {
+			return obj{"user": obj{"repositories": fakePage(t, req, forks)}}
+		}
+		return obj{"user": obj{"repositories": fakePage(t, req, repos)}}
+	})
+
+	if got := repoNames(recentRepos(2)); got != "octocat/a octocat/b" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b", got)
+	}
+	if got := repoNames(recentRepos(10)); got != "octocat/a octocat/b octocat/c" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b octocat/c", got)
+	}
+	if got := repoNames(recentForks(1)); got != "octocat/fork-a" {
+		t.Errorf("got forks %q, want octocat/fork-a", got)
+	}
+	if got := repoNames(recentForks(10)); got != "octocat/fork-a octocat/fork-b" {
+		t.Errorf("got forks %q, want octocat/fork-a octocat/fork-b", got)
+	}
+	if len(*requests) != 4 {
+		t.Errorf("got %d queries, want one per call (4)", len(*requests))
+	}
+}
+
+func TestRecentReposSkipsArchived(t *testing.T) {
+	archived := func(name string) obj { return with(fakeRepo(name), "isArchived", true) }
+	repos := list{archived("octocat/old-a"), fakeRepo("octocat/a"), archived("octocat/old-b"), archived("octocat/old-c"), fakeRepo("octocat/b")}
+	forks := list{archived("octocat/old-fork"), fakeRepo("octocat/fork")}
+
+	fakeGitHub(t, "octocat", func(req graphQLRequest) interface{} {
+		if req.Variables["isFork"].(bool) {
+			return obj{"user": obj{"repositories": fakePage(t, req, forks)}}
+		}
+		return obj{"user": obj{"repositories": fakePage(t, req, repos)}}
+	})
+
+	// archived repositories do not count towards the requested number
+	if got := repoNames(recentRepos(2)); got != "octocat/a octocat/b" {
+		t.Errorf("got repositories %q, want octocat/a octocat/b", got)
+	}
+
+	// forks keep them, and say so
+	got := recentForks(2)
+	if names := repoNames(got); names != "octocat/old-fork octocat/fork" {
+		t.Fatalf("got forks %q, want octocat/old-fork octocat/fork", names)
+	}
+	if !got[0].IsArchived || got[1].IsArchived {
+		t.Errorf("IsArchived is %v and %v, want true and false", got[0].IsArchived, got[1].IsArchived)
+	}
+}

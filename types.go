@@ -49,6 +49,7 @@ type Repo struct {
 	URL         string
 	Description string
 	IsPrivate   bool
+	IsArchived  bool
 	Stargazers  int
 	LastRelease Release
 }
@@ -74,6 +75,11 @@ type qlGist struct {
 	CreatedAt   githubv4.DateTime
 }
 
+type qlPageInfo struct {
+	HasNextPage githubv4.Boolean
+	EndCursor   githubv4.String
+}
+
 type qlPullRequest struct {
 	URL        githubv4.String
 	Title      githubv4.String
@@ -83,14 +89,16 @@ type qlPullRequest struct {
 }
 
 type qlRelease struct {
-	Nodes []struct {
-		Name         githubv4.String
-		TagName      githubv4.String
-		PublishedAt  githubv4.DateTime
-		URL          githubv4.String
-		IsPrerelease githubv4.Boolean
-		IsDraft      githubv4.Boolean
-	}
+	Nodes []qlReleaseNode
+}
+
+type qlReleaseNode struct {
+	Name         githubv4.String
+	TagName      githubv4.String
+	PublishedAt  githubv4.DateTime
+	URL          githubv4.String
+	IsPrerelease githubv4.Boolean
+	IsDraft      githubv4.Boolean
 }
 
 type qlRepository struct {
@@ -98,6 +106,7 @@ type qlRepository struct {
 	URL           githubv4.String
 	Description   githubv4.String
 	IsPrivate     githubv4.Boolean
+	IsArchived    githubv4.Boolean
 	Stargazers    struct {
 		TotalCount githubv4.Int
 	}
@@ -129,13 +138,29 @@ func pullRequestFromQL(pullRequest qlPullRequest) PullRequest {
 	}
 }
 
-func releaseFromQL(release qlRelease) Release {
+func releaseFromQL(release qlReleaseNode) Release {
 	return Release{
-		Name:        string(release.Nodes[0].Name),
-		TagName:     string(release.Nodes[0].TagName),
-		PublishedAt: release.Nodes[0].PublishedAt.Time,
-		URL:         string(release.Nodes[0].URL),
+		Name:        string(release.Name),
+		TagName:     string(release.TagName),
+		PublishedAt: release.PublishedAt.Time,
+		URL:         string(release.URL),
 	}
+}
+
+// latestRelease returns the first release in the list that is published and
+// not a pre-release. The list is expected to start with the newest release.
+func latestRelease(releases qlRelease) (Release, bool) {
+	for _, rel := range releases.Nodes {
+		if rel.IsPrerelease || rel.IsDraft {
+			continue
+		}
+		if rel.TagName == "" || rel.PublishedAt.Time.IsZero() {
+			continue
+		}
+		return releaseFromQL(rel), true
+	}
+
+	return Release{}, false
 }
 
 func repoFromQL(repo qlRepository) Repo {
@@ -145,6 +170,7 @@ func repoFromQL(repo qlRepository) Repo {
 		Description: string(repo.Description),
 		Stargazers:  int(repo.Stargazers.TotalCount),
 		IsPrivate:   bool(repo.IsPrivate),
+		IsArchived:  bool(repo.IsArchived),
 	}
 }
 

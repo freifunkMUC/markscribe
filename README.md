@@ -1,6 +1,6 @@
 # markscribe
 
-> This is a fork of [muesli/markscribe](https://github.com/muesli/markscribe), whose last release is from 2021. It is built with a current Go toolchain and current dependencies and is what [freifunkMUC/readme-scribe](https://github.com/freifunkMUC/readme-scribe) runs. Templates and behaviour are unchanged; the module path is `github.com/freifunkMUC/markscribe`.
+> This is a fork of [muesli/markscribe](https://github.com/muesli/markscribe), whose last release is from 2021. It is built with a current Go toolchain and current dependencies and is what [freifunkMUC/readme-scribe](https://github.com/freifunkMUC/readme-scribe) runs. Templates written for upstream work unchanged; what behaves differently is listed under [Differences from upstream](#differences-from-upstream). The module path is `github.com/freifunkMUC/markscribe`.
 
 [![Latest Release](https://img.shields.io/github/release/muesli/markscribe.svg)](https://github.com/muesli/markscribe/releases)
 [![Build Status](https://github.com/muesli/markscribe/workflows/build/badge.svg)](https://github.com/muesli/markscribe/actions)
@@ -58,10 +58,17 @@ Rendered it looks a little like my own profile page: https://github.com/muesli
 ```
 {{range rss "https://domain.tld/feed.xml" 5}}
 Title: {{.Title}}
+Description: {{.Description}}
 URL: {{.URL}}
+GUID: {{.GUID}}
 Published: {{humanize .PublishedAt}}
 {{end}}
 ```
+
+`Description` is the description or summary of the entry as the feed has it,
+which is often HTML. `GUID` is the identifier of the entry (`guid` in RSS, `id`
+in Atom); it is empty if the feed has none. An entry without a date of
+publication gets the date of its last update.
 
 ### Your recent contributions
 
@@ -119,6 +126,8 @@ Stars: {{.Stargazers}}
 {{end}}
 ```
 
+Forks and archived repositories are not listed.
+
 This function requires GitHub authentication with the following API scopes:
 `repo:status`, `public_repo`, `read:user`.
 
@@ -131,6 +140,7 @@ Description: {{.Description}}
 URL: {{.URL}}
 Stars: {{.Stargazers}}
 Is Private: {{.IsPrivate}}
+Is Archived: {{.IsArchived}}
 Last Git Tag: {{.LastRelease.TagName}}
 Last Release: {{humanize .LastRelease.PublishedAt}}
 {{end}}
@@ -150,6 +160,15 @@ Stars: {{.Stargazers}}
 {{end}}
 ```
 
+Archived forks are listed. Every repository, here and in the other functions,
+has the field `IsArchived`, so a template can leave them out:
+
+```
+{{range recentForks 10}}{{if not .IsArchived}}
+Name: {{.Name}}
+{{end}}{{end}}
+```
+
 This function requires GitHub authentication with the following API scopes:
 `repo:status`, `public_repo`, `read:user`.
 
@@ -163,6 +182,13 @@ URL: {{.LastRelease.URL}}
 Published: {{humanize .LastRelease.PublishedAt}}
 {{end}}
 ```
+
+This lists the public repositories you committed to during the past year,
+each with its latest release, sorted by the date of that release. Drafts and
+pre-releases are not counted as releases. Whether a commit of yours is part
+of that release is not checked: GitHub's API offers no reliable way to find
+out, so a repository also shows up when your commits are still waiting for
+the next release.
 
 This function requires GitHub authentication with the following API scopes:
 `repo:status`, `public_repo`, `read:user`.
@@ -261,6 +287,34 @@ To reverse the order of a slice, call `reverse`:
 ```
 {{reverse (rss "https://domain.tld/feed.xml" 5)}}
 ```
+
+To shorten a text, call `truncate` with the number of characters to keep and
+the text to append when something was cut off:
+
+```
+{{truncate .Description 80 "…"}}
+```
+
+A text that is not longer than that is left as it is.
+
+## Differences from upstream
+
+- `recentContributions` and `recentReleases` also work for accounts with many
+  contributions, for which the queries upstream sends fail at GitHub.
+  `recentReleases` looks at the repositories you committed to during the past
+  year.
+- `recentReleases` shows the latest published release of a repository. A draft
+  or a pre-release as the newest release no longer hides the repository or
+  takes the place of the latest release.
+- `recentPullRequests`, `recentRepos` and `recentForks` return as many entries
+  as asked for, if there are that many. Upstream returns fewer when pull
+  requests in private repositories or the profile repository are among the
+  most recent ones.
+- `recentRepos` leaves out archived repositories.
+- `repo` works for a repository without releases.
+- Repositories have the field `IsArchived`, entries of an RSS feed the fields
+  `Description` and `GUID`, and there is the helper `truncate`.
+- An RSS entry without a date of publication no longer stops the rendering.
 
 ## GitHub Authentication
 

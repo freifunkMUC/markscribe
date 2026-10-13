@@ -29,6 +29,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The tests need neither a token nor the network: they run against a
+      # local stand-in for the GitHub API.
+      - name: Test
+        run: go test ./...
+
       # A template without calls to the GitHub API needs no token.
       - name: Render a template
         run: |
