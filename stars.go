@@ -11,6 +11,7 @@ var recentStarsQuery struct {
 		Login githubv4.String
 		Stars struct {
 			TotalCount githubv4.Int
+			PageInfo   qlPageInfo
 			Edges      []struct {
 				Cursor    githubv4.String
 				StarredAt githubv4.DateTime
@@ -22,13 +23,19 @@ var recentStarsQuery struct {
 
 func recentStars(count int) []Star {
 	var starredRepos []Star
-	var after *githubv4.String
+	if count <= 0 {
+		return starredRepos
+	}
 
-outer:
+	var after *githubv4.String
+	pageSize := count
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
 	for {
 		variables := map[string]interface{}{
 			"username": githubv4.String(username),
-			"count":    githubv4.Int(count),
+			"count":    githubv4.Int(pageSize),
 			"after":    after,
 		}
 		err := gitHubClient.Query(context.Background(), &recentStarsQuery, variables)
@@ -45,10 +52,19 @@ outer:
 				Repo:      repoFromQL(v.Node),
 			})
 			if len(starredRepos) >= count {
-				break outer
+				return starredRepos
 			}
-			after = githubv4.NewString(v.Cursor)
 		}
+
+		// Without this check the loop asked for the last page again and
+		// again when there were fewer public stars than wanted.
+		pageInfo := recentStarsQuery.User.Stars.PageInfo
+		if !pageInfo.HasNextPage {
+			break
+		}
+		after = githubv4.NewString(pageInfo.EndCursor)
+		// the first page was not enough, so do not go on in small steps
+		pageSize = maxPageSize
 	}
 
 	return starredRepos
