@@ -4,8 +4,21 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/shurcooL/githubv4"
+)
+
+const (
+	// contributionWindows times contributionWindowMonths is the period
+	// that recentContributions and recentReleases look back on. GitHub
+	// allows at most one year per contributionsCollection.
+	contributionWindows      = 4
+	contributionWindowMonths = 3
+
+	// releaseBatchSize is the number of repositories whose releases are
+	// requested in a single query.
+	releaseBatchSize = 50
 )
 
 var recentContributionsQuery struct {
@@ -21,9 +34,12 @@ var recentContributionsQuery struct {
 						}
 					}
 				} `graphql:"contributions(first: 1)"`
-				Repository qlRepository
+				Repository struct {
+					ID githubv4.ID
+					qlRepository
+				}
 			} `graphql:"commitContributionsByRepository(maxRepositories: 100)"`
-		}
+		} `graphql:"contributionsCollection(from: $from, to: $to)"`
 	} `graphql:"user(login:$username)"`
 }
 
@@ -53,20 +69,13 @@ var recentReposQuery struct {
 	} `graphql:"user(login:$username)"`
 }
 
-var recentReleasesQuery struct {
-	User struct {
-		Login                     githubv4.String
-		RepositoriesContributedTo struct {
-			TotalCount githubv4.Int
-			Edges      []struct {
-				Cursor githubv4.String
-				Node   struct {
-					qlRepository
-					Releases qlRelease `graphql:"releases(first: 10, orderBy: {field: CREATED_AT, direction: DESC})"`
-				}
-			}
-		} `graphql:"repositoriesContributedTo(first: 100, after:$after includeUserRepositories: true, contributionTypes: COMMIT, privacy: PUBLIC)"`
-	} `graphql:"user(login:$username)"`
+var repoReleasesQuery struct {
+	Nodes []struct {
+		Repository struct {
+			ID       githubv4.ID
+			Releases qlRelease `graphql:"releases(first: 10, orderBy: {field: CREATED_AT, direction: DESC})"`
+		} `graphql:"... on Repository"`
+	} `graphql:"nodes(ids: $ids)"`
 }
 
 var repoQuery struct {
@@ -82,19 +91,118 @@ var repoQuery struct {
 	} `graphql:"repository(owner:$owner, name:$name)"`
 }
 
+// repoContribution is a repository the user committed to and the time of
+// the most recent commit contribution to it.
+type repoContribution struct {
+	ID         githubv4.ID
+	Repository qlRepository
+	OccurredAt time.Time
+}
+
+type timeWindow struct {
+	From time.Time
+	To   time.Time
+}
+
+// contributedReposCache keeps the result of contributedRepos, so that a
+// template that calls both recentContributions and recentReleases asks
+// GitHub only once.
+var contributedReposCache []repoContribution
+
+// windowsBefore splits the period that ends at now into count consecutive
+// windows of the given number of months, most recent first.
+func windowsBefore(now time.Time, count, months int) []timeWindow {
+	windows := make([]timeWindow, 0, count)
+	for i := 0; i < count; i++ {
+		windows = append(windows, timeWindow{
+			From: now.AddDate(0, -(i+1)*months, 0),
+			To:   now.AddDate(0, -i*months, 0),
+		})
+	}
+	return windows
+}
+
+// mergeContributions adds the contributions in add to merged and returns
+// the result. Each repository is kept once, with its most recent
+// contribution.
+func mergeContributions(merged, add []repoContribution) []repoContribution {
+	index := make(map[githubv4.String]int, len(merged))
+	for i, c := range merged {
+		index[c.Repository.NameWithOwner] = i
+	}
+
+	for _, c := range add {
+		if i, ok := index[c.Repository.NameWithOwner]; ok {
+			if c.OccurredAt.After(merged[i].OccurredAt) {
+				merged[i] = c
+			}
+			continue
+		}
+		index[c.Repository.NameWithOwner] = len(merged)
+		merged = append(merged, c)
+	}
+
+	return merged
+}
+
+// contributedRepos returns the repositories the user committed to over the
+// past year, most recent contribution first.
+//
+// GitHub limits the resources a single GraphQL query may use. For accounts
+// with many contributions the default window of contributionsCollection,
+// one year, exceeds that limit and the query fails, whatever it selects. So
+// the year is queried in shorter windows and the results are merged.
+func contributedRepos() []repoContribution {
+	if contributedReposCache != nil {
+		return contributedReposCache
+	}
+
+	contributions := []repoContribution{}
+	for _, w := range windowsBefore(time.Now(), contributionWindows, contributionWindowMonths) {
+		variables := map[string]interface{}{
+			"username": githubv4.String(username),
+			"from":     githubv4.DateTime{Time: w.From},
+			"to":       githubv4.DateTime{Time: w.To},
+		}
+		err := gitHubClient.Query(context.Background(), &recentContributionsQuery, variables)
+		if err != nil {
+			panic(err)
+		}
+
+		var window []repoContribution
+		for _, v := range recentContributionsQuery.User.ContributionsCollection.CommitContributionsByRepository {
+			if len(v.Contributions.Edges) == 0 {
+				continue
+			}
+
+			window = append(window, repoContribution{
+				ID:         v.Repository.ID,
+				Repository: v.Repository.qlRepository,
+				OccurredAt: v.Contributions.Edges[0].Node.OccurredAt.Time,
+			})
+		}
+		contributions = mergeContributions(contributions, window)
+	}
+
+	// Contributions are dated by the day. Repositories with the same day
+	// are sorted by name, so that their order does not depend on the order
+	// within a window, which changes as the windows move on.
+	sort.Slice(contributions, func(i, j int) bool {
+		if contributions[i].OccurredAt.Equal(contributions[j].OccurredAt) {
+			return contributions[i].Repository.NameWithOwner < contributions[j].Repository.NameWithOwner
+		}
+		return contributions[i].OccurredAt.After(contributions[j].OccurredAt)
+	})
+
+	contributedReposCache = contributions
+	return contributions
+}
+
 func recentContributions(count int) []Contribution {
 	// fmt.Printf("Finding recent contributions...\n")
 
 	var contributions []Contribution
-	variables := map[string]interface{}{
-		"username": githubv4.String(username),
-	}
-	err := gitHubClient.Query(context.Background(), &recentContributionsQuery, variables)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, v := range recentContributionsQuery.User.ContributionsCollection.CommitContributionsByRepository {
+	for _, v := range contributedRepos() {
 		// ignore meta-repo
 		if string(v.Repository.NameWithOwner) == fmt.Sprintf("%s/%s", username, username) {
 			continue
@@ -103,17 +211,11 @@ func recentContributions(count int) []Contribution {
 			continue
 		}
 
-		c := Contribution{
+		contributions = append(contributions, Contribution{
 			Repo:       repoFromQL(v.Repository),
-			OccurredAt: v.Contributions.Edges[0].Node.OccurredAt.Time,
-		}
-
-		contributions = append(contributions, c)
+			OccurredAt: v.OccurredAt,
+		})
 	}
-
-	sort.Slice(contributions, func(i, j int) bool {
-		return contributions[i].OccurredAt.After(contributions[j].OccurredAt)
-	})
 
 	// fmt.Printf("Found %d contributions!\n", len(repos))
 	if len(contributions) > count {
@@ -214,47 +316,78 @@ func recentForks(count int) []Repo {
 	return repos
 }
 
-func recentReleases(count int) []Repo {
-	// fmt.Printf("Finding recent releases...\n")
+// repoReleases returns the most recent releases of the repositories with
+// the given node IDs.
+func repoReleases(ids []githubv4.ID) map[githubv4.ID]qlRelease {
+	releases := make(map[githubv4.ID]qlRelease, len(ids))
 
-	var after *githubv4.String
-	var repos []Repo
-
-	for {
-		variables := map[string]interface{}{
-			"username": githubv4.String(username),
-			"after":    after,
+	for len(ids) > 0 {
+		batch := ids
+		if len(batch) > releaseBatchSize {
+			batch = batch[:releaseBatchSize]
 		}
-		err := gitHubClient.Query(context.Background(), &recentReleasesQuery, variables)
+		ids = ids[len(batch):]
+
+		variables := map[string]interface{}{
+			"ids": batch,
+		}
+		err := gitHubClient.Query(context.Background(), &repoReleasesQuery, variables)
 		if err != nil {
 			panic(err)
 		}
 
-		// fmt.Printf("%+v\n", query)
-		if len(recentReleasesQuery.User.RepositoriesContributedTo.Edges) == 0 {
+		for _, v := range repoReleasesQuery.Nodes {
+			// a repository that cannot be read comes back empty
+			if v.Repository.ID == nil {
+				continue
+			}
+			releases[v.Repository.ID] = v.Repository.Releases
+		}
+	}
+
+	return releases
+}
+
+// recentReleases returns the public repositories the user committed to over
+// the past year that have a release, most recent release first.
+//
+// It used to ask for repositoriesContributedTo with the releases of every
+// repository in one query. For accounts with many contributions that query
+// runs into GitHub's resource limits, so the repositories now come from the
+// contributions and their releases are requested in batches.
+func recentReleases(count int) []Repo {
+	// fmt.Printf("Finding recent releases...\n")
+
+	var contributions []repoContribution
+	var ids []githubv4.ID
+	for _, c := range contributedRepos() {
+		if c.Repository.IsPrivate {
+			continue
+		}
+		contributions = append(contributions, c)
+		ids = append(ids, c.ID)
+	}
+	releases := repoReleases(ids)
+
+	var repos []Repo
+	for _, c := range contributions {
+		r := repoFromQL(c.Repository)
+		rels := releases[c.ID]
+
+		for _, rel := range rels.Nodes {
+			if rel.IsPrerelease || rel.IsDraft {
+				continue
+			}
+			if rels.Nodes[0].TagName == "" ||
+				rels.Nodes[0].PublishedAt.Time.IsZero() {
+				continue
+			}
+			r.LastRelease = releaseFromQL(rels)
 			break
 		}
 
-		for _, v := range recentReleasesQuery.User.RepositoriesContributedTo.Edges {
-			r := repoFromQL(v.Node.qlRepository)
-
-			for _, rel := range v.Node.Releases.Nodes {
-				if rel.IsPrerelease || rel.IsDraft {
-					continue
-				}
-				if v.Node.Releases.Nodes[0].TagName == "" ||
-					v.Node.Releases.Nodes[0].PublishedAt.Time.IsZero() {
-					continue
-				}
-				r.LastRelease = releaseFromQL(v.Node.Releases)
-				break
-			}
-
-			if !r.LastRelease.PublishedAt.IsZero() {
-				repos = append(repos, r)
-			}
-
-			after = githubv4.NewString(v.Cursor)
+		if !r.LastRelease.PublishedAt.IsZero() {
+			repos = append(repos, r)
 		}
 	}
 
