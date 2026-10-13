@@ -58,10 +58,17 @@ Rendered it looks a little like my own profile page: https://github.com/muesli
 ```
 {{range rss "https://domain.tld/feed.xml" 5}}
 Title: {{.Title}}
+Description: {{.Description}}
 URL: {{.URL}}
+GUID: {{.GUID}}
 Published: {{humanize .PublishedAt}}
 {{end}}
 ```
+
+`Description` is the description or summary of the entry as the feed has it,
+which is often HTML. `GUID` is the identifier of the entry (`guid` in RSS, `id`
+in Atom); it is empty if the feed has none. An entry without a date of
+publication gets the date of its last update.
 
 ### Your recent contributions
 
