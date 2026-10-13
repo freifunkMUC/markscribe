@@ -288,6 +288,15 @@ To reverse the order of a slice, call `reverse`:
 {{reverse (rss "https://domain.tld/feed.xml" 5)}}
 ```
 
+To shorten a text, call `truncate` with the number of characters to keep and
+the text to append when something was cut off:
+
+```
+{{truncate .Description 80 "…"}}
+```
+
+A text that is not longer than that is left as it is.
+
 ## GitHub Authentication
 
 In order to access some of GitHub's API, markscribe requires you to provide a

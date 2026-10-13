@@ -1,1 +1,1 @@
-Rendered {{ "by markscribe" }}.
+Rendered {{ truncate "by markscribe, shortened" 13 "" }}.
